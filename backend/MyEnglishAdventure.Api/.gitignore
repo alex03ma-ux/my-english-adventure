@@ -1,0 +1,21 @@
+
+# React Native / Expo
+node_modules/
+.expo/
+dist/
+
+# Backend .NET
+**/bin/
+**/obj/
+
+# Configuraciones privadas
+.env
+.env.*
+!.env.example
+**/appsettings.Development.json
+**/appsettings.Local.json
+
+# Archivos temporales
+*.log
+*.user
+*.suo
