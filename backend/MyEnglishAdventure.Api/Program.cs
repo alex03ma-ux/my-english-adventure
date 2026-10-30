@@ -184,30 +184,112 @@ app.MapPost(
 
             var passwordHash = passwordService.HashPassword(password);
 
-            await using var command = connection.CreateCommand();
-            command.CommandText = """
-                INSERT INTO students (name, email, password_hash)
-                VALUES (@name, @email, @passwordHash);
-                """;
+            var transaction = await connection.BeginTransactionAsync();
+            var studentInsertDuplicate = false;
+            var transactionFailed = false;
+            try
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    INSERT INTO students (name, email, password_hash)
+                    VALUES (@name, @email, @passwordHash);
+                    """;
 
-            command.Parameters.AddWithValue("@name", name);
-            command.Parameters.AddWithValue("@email", email);
-            command.Parameters.AddWithValue("@passwordHash", passwordHash);
+                command.Parameters.AddWithValue("@name", name);
+                command.Parameters.AddWithValue("@email", email);
+                command.Parameters.AddWithValue("@passwordHash", passwordHash);
 
-            await command.ExecuteNonQueryAsync();
+                try
+                {
+                    await command.ExecuteNonQueryAsync();
+                }
+                catch (MySqlConnector.MySqlException ex) when (ex.Number == 1062)
+                {
+                    // Solo un duplicado del INSERT de students permite comprobar el correo.
+                    studentInsertDuplicate = true;
+                    throw;
+                }
+
+                var studentId = command.LastInsertedId;
+                if (studentId <= 0)
+                {
+                    throw new InvalidOperationException("No se obtuvo el identificador del estudiante.");
+                }
+
+                await using var progressCommand = connection.CreateCommand();
+                progressCommand.Transaction = transaction;
+                progressCommand.CommandText = """
+                    INSERT INTO student_learning_progress
+                        (student_id, current_day, last_completed_at)
+                    VALUES (@studentId, 1, NULL);
+                    """;
+                progressCommand.Parameters.AddWithValue("@studentId", studentId);
+                await progressCommand.ExecuteNonQueryAsync();
+
+                await transaction.CommitAsync();
+            }
+            catch
+            {
+                transactionFailed = true;
+                var rollbackSucceeded = false;
+                try
+                {
+                    await transaction.RollbackAsync();
+                    rollbackSucceeded = true;
+                }
+                catch
+                {
+                    // Conservar la excepción original; no reintentar el rollback.
+                }
+
+                if (studentInsertDuplicate && rollbackSucceeded)
+                {
+                    var emailExists = false;
+                    try
+                    {
+                        await using var duplicateCheck = connection.CreateCommand();
+                        // Sin Transaction: la comprobación ocurre después de la reversión.
+                        duplicateCheck.CommandText =
+                            "SELECT EXISTS(SELECT 1 FROM students WHERE email = @email)";
+                        duplicateCheck.Parameters.AddWithValue("@email", email);
+                        emailExists = Convert.ToInt64(
+                            await duplicateCheck.ExecuteScalarAsync()) == 1;
+                    }
+                    catch
+                    {
+                        // Si la comprobación falla, propagar el error original como interno.
+                        emailExists = false;
+                    }
+
+                    if (emailExists)
+                    {
+                        return Results.Conflict(new
+                        {
+                            mensaje = "Ya existe una cuenta con ese correo."
+                        });
+                    }
+                }
+
+                throw;
+            }
+            finally
+            {
+                try
+                {
+                    await transaction.DisposeAsync();
+                }
+                catch when (transactionFailed)
+                {
+                    // La liberación tampoco debe ocultar el error original o el conflicto confirmado.
+                }
+            }
 
             return Results.Created("/api/students/register", new
             {
                 mensaje = "Estudiante registrado correctamente.",
                 nombre = name,
                 correo = email
-            });
-        }
-        catch (MySqlConnector.MySqlException ex) when (ex.Number == 1062)
-        {
-            return Results.Conflict(new
-            {
-                mensaje = "Ya existe una cuenta con ese correo."
             });
         }
         catch
